@@ -246,7 +246,9 @@ impl<'devlist> Device<'devlist> {
     ///  - `EMFILE`: Too many files are opened by this process (from `ibv_query_gid`).
     ///  - Other: the device is not in `ACTIVE` or `ARMED` state.
     pub fn open(&self) -> io::Result<Context> {
-        Context::with_device(*self.0)
+        // SAFETY: This is safe because `Device<'devlist>`'s lifetime is bounded by `DeviceList``.
+        // `DeviceList` can't be freed while `Device` is still in use.
+        unsafe { Context::with_device(*self.0) }
     }
 
     /// Returns a string of the name, which is associated with this RDMA device.
@@ -320,10 +322,9 @@ impl<'devlist> Device<'devlist> {
 }
 
 /// An RDMA context bound to a device.
+#[repr(transparent)]
 pub struct Context {
     ctx: *mut ffi::ibv_context,
-    port_attr: ffi::ibv_port_attr,
-    gid: Gid,
 }
 
 unsafe impl Sync for Context {}
@@ -331,7 +332,11 @@ unsafe impl Send for Context {}
 
 impl Context {
     /// Opens a context for the given device, and queries its port and gid.
-    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
+    ///
+    /// # Safety
+    ///
+    /// The pointer to `ffi::ibv_device` must be valid.
+    unsafe fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
         assert!(!dev.is_null());
 
         let ctx = unsafe { ffi::ibv_open_device(dev) };
@@ -342,6 +347,11 @@ impl Context {
             ));
         }
 
+        Ok(Context { ctx })
+    }
+
+    /// Returns the port_attr for the given context.
+    pub fn port_attr(&self) -> io::Result<ffi::ibv_port_attr> {
         // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
         //
         //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
@@ -352,7 +362,7 @@ impl Context {
         let mut port_attr = ffi::ibv_port_attr::default();
         let errno = unsafe {
             ffi::ibv_query_port(
-                ctx,
+                self.ctx,
                 PORT_NUM,
                 &mut port_attr as *mut ffi::ibv_port_attr as *mut _,
             )
@@ -377,18 +387,18 @@ impl Context {
             }
         }
 
+        Ok(port_attr)
+    }
+
+    /// Returns the GID of the given context.
+    pub fn gid(&self, index: u32) -> io::Result<Gid> {
         // let mut gid = ffi::ibv_gid::default();
         let mut gid = Gid::default();
-        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, gid.as_mut()) };
+        let ok = unsafe { ffi::ibv_query_gid(self.ctx, PORT_NUM, index as _, gid.as_mut()) };
         if ok != 0 {
             return Err(io::Error::last_os_error());
         }
-
-        Ok(Context {
-            ctx,
-            port_attr,
-            gid,
-        })
+        Ok(gid)
     }
 
     /// Create a completion queue (CQ).
@@ -425,8 +435,8 @@ impl Context {
             Err(io::Error::last_os_error())
         } else {
             Ok(CompletionQueue {
-                _phantom: PhantomData,
                 cq,
+                _phantom: PhantomData,
             })
         }
     }
@@ -446,7 +456,10 @@ impl Context {
                 "obv_alloc_pd returned null",
             ))
         } else {
-            Ok(ProtectionDomain { ctx: self, pd })
+            Ok(ProtectionDomain {
+                pd,
+                _ctx: PhantomData,
+            })
         }
     }
 }
@@ -459,15 +472,26 @@ impl Drop for Context {
 }
 
 /// A completion queue that allows subscribing to the completion of queued sends and receives.
+#[repr(transparent)]
 pub struct CompletionQueue<'ctx> {
-    _phantom: PhantomData<&'ctx ()>,
     cq: *mut ffi::ibv_cq,
+    _phantom: PhantomData<&'ctx ()>,
 }
 
 unsafe impl<'a> Send for CompletionQueue<'a> {}
 unsafe impl<'a> Sync for CompletionQueue<'a> {}
 
 impl<'ctx> CompletionQueue<'ctx> {
+    /// Exposes the inner ffi object.
+    ///
+    /// The caller must ensure that the CompletionQueue outlives the pointer
+    /// this function returns, or else it will end up dangling.
+    /// The caller also must not destroy the cq by calling `ibv_destroy_cq`.
+    #[inline]
+    pub fn cq(&self) -> *mut ffi::ibv_cq {
+        self.cq
+    }
+
     /// Poll for (possibly multiple) work completions.
     ///
     /// A Work Completion indicates that a Work Request in a Work Queue, and all of the outstanding
@@ -621,7 +645,7 @@ impl<'res> QueuePairBuilder<'res> {
             max_dest_rd_atomic: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(1),
             path_mtu: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
-                .then_some(pd.ctx.port_attr.active_mtu),
+                .then_some(pd.context().port_attr().unwrap().active_mtu),
             rq_psn: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(0),
@@ -908,10 +932,11 @@ impl<'res> QueuePairBuilder<'res> {
             Err(io::Error::last_os_error())
         } else {
             Ok(PreparedQueuePair {
-                ctx: self.pd.ctx,
+                port_attr: self.pd.context().port_attr()?,
+                gid: self.pd.context().gid(0)?,
                 qp: QueuePair {
-                    _phantom: PhantomData,
                     qp,
+                    _phantom: PhantomData,
                 },
                 access: self.access,
                 timeout: self.timeout,
@@ -952,7 +977,8 @@ impl<'res> QueuePairBuilder<'res> {
 /// let qp = pqp.handshake(host1end);
 /// ```
 pub struct PreparedQueuePair<'res> {
-    ctx: &'res Context,
+    port_attr: ffi::ibv_port_attr,
+    gid: Gid,
     qp: QueuePair<'res>,
 
     // carried from builder
@@ -1069,8 +1095,8 @@ impl<'res> PreparedQueuePair<'res> {
 
         QueuePairEndpoint {
             num,
-            lid: self.ctx.port_attr.lid,
-            gid: Some(self.ctx.gid),
+            lid: self.port_attr.lid,
+            gid: Some(self.gid),
         }
     }
 
@@ -1253,15 +1279,37 @@ impl<T> Drop for MemoryRegion<T> {
 }
 
 /// A protection domain for a device's context.
+#[repr(transparent)]
 pub struct ProtectionDomain<'ctx> {
-    ctx: &'ctx Context,
     pd: *mut ffi::ibv_pd,
+    _ctx: PhantomData<&'ctx Context>,
 }
 
 unsafe impl<'a> Sync for ProtectionDomain<'a> {}
 unsafe impl<'a> Send for ProtectionDomain<'a> {}
 
 impl<'ctx> ProtectionDomain<'ctx> {
+    /// Exposes the inner ffi object.
+    ///
+    /// The caller must ensure that the ProtectionDomain outlives the pointer
+    /// this function returns, or else it will end up dangling.
+    /// The caller also must not dealloc the pd by calling `ibv_dealloc_pd`.
+    #[inline]
+    pub fn pd(&self) -> *mut ffi::ibv_pd {
+        self.pd
+    }
+
+    /// Returns the context of the protection domain.
+    #[inline]
+    pub fn context(&self) -> &Context {
+        // SAFETY: ProtectionDomain is valid -> pd is valid -> ctx is valid
+        let ctx = &unsafe { &*self.pd }.context;
+        // SAFETY: &Context has a lifetime shorter than &ProtectionDomain<'c>.
+        // and since ProtectionDomain is valid, it's pointer to ibv_context,
+        // (which is just a borrow pointer) should be valid too.
+        unsafe { core::mem::transmute(ctx) }
+    }
+
     /// Creates a queue pair builder associated with this protection domain.
     ///
     /// `send` and `recv` are the device `Context` to associate with the send and receive queues
@@ -1376,15 +1424,42 @@ impl<'a> Drop for ProtectionDomain<'a> {
 /// which is maintained by the network stack and doesn't have a physical resource behind it. A QP
 /// is a resource of an RDMA device and a QP number can be used by one process at the same time
 /// (similar to a socket that is associated with a specific TCP or UDP port number)
+#[repr(transparent)]
 pub struct QueuePair<'res> {
-    _phantom: PhantomData<&'res ()>,
     qp: *mut ffi::ibv_qp,
+    _phantom: PhantomData<&'res ()>,
 }
 
 unsafe impl<'a> Send for QueuePair<'a> {}
 unsafe impl<'a> Sync for QueuePair<'a> {}
 
 impl<'res> QueuePair<'res> {
+    // /// Exposes the inner ffi object.
+    // ///
+    // /// The caller must ensure that the QueuePair outlives the pointer
+    // /// this function returns, or else it will end up dangling.
+    // /// The caller also must not dealloc the qp by calling `ibv_destroy_qp`.
+    // #[inline]
+    // pub fn qp(&self) -> *mut ffi::ibv_qp {
+    //     self.qp
+    // }
+
+    // /// Constructs a QueuePair object from raw ibv_qp objects.
+    // ///
+    // /// # Safety
+    // ///
+    // /// This is extreme unsafe to use. The input `*mut ibv_qp` must be a valid
+    // /// QP object and must be remain valid. This API takes the ownership of the
+    // /// input QP object.
+    // #[inline]
+    // pub unsafe fn from_raw_qp<'a>(qp: *mut ffi::ibv_qp) -> QueuePair<'a> {
+    //     assert!(!qp.is_null());
+    //     QueuePair {
+    //         qp,
+    //         _phantom: PhantomData,
+    //     }
+    // }
+
     /// Posts a linked list of Work Requests (WRs) to the Send Queue of this Queue Pair.
     ///
     /// Generates a HW-specific Send Request for the memory at `mr[range]`, and adds it to the tail
