@@ -11,7 +11,7 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ibv_wc {
-    wr_id: u64,
+    pub wr_id: u64,
     status: ibv_wc_status::Type,
     opcode: ibv_wc_opcode::Type,
     vendor_err: u32,
