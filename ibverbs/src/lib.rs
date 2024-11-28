@@ -1262,7 +1262,7 @@ impl<T> MemoryRegion<T> {
 
 /// A key that authorizes direct memory access to a memory region.
 #[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
+// #[non_exhaustive]
 pub struct RemoteKey {
     /// The actual key value.
     pub key: u32,
