@@ -1261,6 +1261,8 @@ impl<T> MemoryRegion<T> {
 }
 
 /// A key that authorizes direct memory access to a memory region.
+#[cfg(feature = "serde")]
+#[derive(Serialize, Deserialize)]
 #[derive(Debug, Clone, Copy)]
 // #[non_exhaustive]
 pub struct RemoteKey {
