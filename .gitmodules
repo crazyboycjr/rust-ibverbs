@@ -1,3 +1,4 @@
 [submodule "vendor/rdma-core"]
 	path = ibverbs-sys/vendor/rdma-core
-	url = https://github.com/linux-rdma/rdma-core.git
+	url = https://github.com/crazyboycjr/rdma-core.git
+	branch = phoenix-provider
